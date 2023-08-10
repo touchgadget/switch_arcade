@@ -63,6 +63,7 @@ SOFTWARE.
 #endif
 
 #include <stdint.h>
+#include <limits.h>
 
 /************************************************************/
 
@@ -77,21 +78,38 @@ typedef struct __attribute__ ((packed)) {
   uint8_t vendorspec1;
 } Arcade_t ;
 
-// Arcade USB controller
-typedef struct arcade_state {
-  Arcade_t report;
-  const uint16_t USB_VID = 0x0079;
-  const uint16_t USB_PID = 0x0006;
+typedef enum HID_type {
+  HID_dev_unknown,
+  HID_dev_keyboard,
+  HID_dev_mouse,
+  HID_dev_joystick,
+  HID_dev_gamepad,
+  HID_dev_arcade_stick,
+} HID_type_t;
+
+const uint16_t ARCADE_VID = 0x0079;
+const uint16_t ARCADE_PID = 0x0006;
+
+typedef struct HID_device_state {
+  HID_type_t hid_type;
+  uint8_t report[64];
+  uint8_t report_len;
   uint8_t dev_addr;
   uint8_t instance;
-  uint8_t report_len;
-  bool connected = false;
-  bool available = false;
-  bool debug = false;
-} Arcade_state_t;
+  int16_t xmin;
+  int16_t xmax;
+  int16_t ymin;
+  int16_t ymax;
+  uint32_t report_count;
+  uint32_t available_count;
+  uint32_t last_millis;
+  bool available;
+  bool connected;
+  bool skip_report_id;
+} HID_device_state_t;
 
-#define MAX_ARCADE  (2)
-volatile Arcade_state_t Arcade[MAX_ARCADE];
+#define MAX_HID_DEVICES (4)
+volatile HID_device_state_t HID_devices[MAX_HID_DEVICES];
 
 // pio-usb is required for rp2040 usb host
 #include "pio_usb.h"
@@ -105,6 +123,29 @@ NSGamepad Gamepad(&G_usb_hid);
 
 // USB Host object for arcade controllers
 Adafruit_USBH_Host USBHost;
+
+uint8_t X_SENSITIVITY[129];
+uint8_t Y_SENSITIVITY[129];
+
+void sensitivity(float x_speed, float y_speed, uint8_t deadzone) {
+  for (size_t i = 0; i < 128; i++) {
+    if (i < deadzone) {
+      X_SENSITIVITY[i] = 0;
+      Y_SENSITIVITY[i] = 0;
+    } else {
+      X_SENSITIVITY[i] = int((pow(i/127.0f, x_speed) * 127) + 0.5);
+      Y_SENSITIVITY[i] = int((pow(i/127.0f, y_speed) * 127) + 0.5);
+      if (i > 0) {
+        if (X_SENSITIVITY[i] == 0) X_SENSITIVITY[i] = 1;
+        if (Y_SENSITIVITY[i] == 0) Y_SENSITIVITY[i] = 1;
+      }
+    }
+    DBG_printf("%d: X_SENSITIVITY %d Y_SENSITIVITY %d\r\n",
+        i, X_SENSITIVITY[i], Y_SENSITIVITY[i]);
+  }
+  X_SENSITIVITY[128] = X_SENSITIVITY[127];
+  Y_SENSITIVITY[128] = Y_SENSITIVITY[127];
+}
 
 //--------------------------------------------------------------------+
 // Setup and Loop on Core0
@@ -125,12 +166,13 @@ void setup()
   Gamepad.begin();
 
   // wait until device mounted
-  while( !TinyUSBDevice.mounted() ) delay(1);
+  while( !TinyUSBDevice.mounted() ) delay(10);
 #if USB_DEBUG
-  while (!Serial) { delay(1); }
+  while (!Serial && (millis() < 3000)) { delay(10); }
 #endif
 
   DBG_println("Switch TinyUSB Gamepad mounted");
+  sensitivity(0.5f, 0.5f, 2);
 }
 
 // Swap buttons 0 and 2 so the joystick trigger maps to the gamepad A button.
@@ -142,67 +184,131 @@ uint16_t remap(uint16_t buttons) {
   return buttons;
 }
 
+static inline int smin(int x, int y) {return (x < y) ? x : y;}
+static inline int smax(int x, int y) {return (x > y) ? x : y;}
+
+void handle_mouse(volatile HID_device_state_t *hid_dev) {
+  if (hid_dev->report_len > 2) {
+    uint8_t buttons = hid_dev->report[0];
+    if (buttons & 1) {
+      Gamepad.press(NSButton_A);
+    } else {
+      Gamepad.release(NSButton_A);
+    }
+    if (buttons & 2) {
+      Gamepad.press(NSButton_B);
+    } else {
+      Gamepad.release(NSButton_B);
+    }
+    int8_t x = (int8_t)hid_dev->report[1];
+    int8_t y = (int8_t)hid_dev->report[2];
+    if (x < 0)
+      x = -X_SENSITIVITY[-x];
+    else
+      x = X_SENSITIVITY[x];
+    if (y < 0)
+      y = -Y_SENSITIVITY[-y];
+    else
+      y = Y_SENSITIVITY[y];
+    hid_dev->xmin = smin(x, hid_dev->xmin);
+    hid_dev->xmax = smax(x, hid_dev->xmax);
+    hid_dev->ymin = smin(y, hid_dev->ymin);
+    hid_dev->ymax = smax(y, hid_dev->ymax);
+    uint8_t u8x = map(x, hid_dev->xmin, hid_dev->xmax, 0, 255);
+    uint8_t u8y = map(y, hid_dev->ymin, hid_dev->ymax, 0, 255);
+    DBG_printf("xmin %d x %d xmax %d u8x %d ymin %d y %d ymax %d u8y %d\r\n",
+        hid_dev->xmin, x, hid_dev->xmax, u8x, hid_dev->ymin, y, hid_dev->ymax, u8y);
+    if (hid_dev->dev_addr & 1) {
+      Gamepad.leftXAxis(u8x);
+      Gamepad.leftYAxis(u8y);
+    } else {
+      Gamepad.rightXAxis(u8x);
+      Gamepad.rightYAxis(u8y);
+    }
+  }
+  hid_dev->available = false;
+}
+
+void handle_timeout(volatile HID_device_state_t *hid_dev) {
+  if ((millis() - hid_dev->last_millis) > 31) {
+    // Center x,y if no HID report for 32 ms.
+    if (hid_dev->dev_addr & 1) {
+      Gamepad.leftXAxis(127);
+      Gamepad.leftYAxis(127);
+    } else {
+      Gamepad.rightXAxis(127);
+      Gamepad.rightYAxis(127);
+    }
+    hid_dev->last_millis = millis();
+    Gamepad.loop();
+  }
+}
+
+void handle_arcade_stick(volatile HID_device_state_t *hid_dev) {
+  if (sizeof(Arcade_t) == hid_dev->report_len) {
+    volatile Arcade_t *rpt = (volatile Arcade_t *)&hid_dev->report;
+    static uint16_t old_buttons = 0;
+    uint16_t buttons = old_buttons;
+    if (hid_dev->dev_addr & 1) {
+      uint16_t left_trigger = (rpt->buttons & (1<<0)) << 4;
+      uint16_t left_throttle = (rpt->buttons & (1<<1)) << 5;
+      uint16_t minus = (rpt->buttons & (1<<2)) << 6;
+      uint16_t left_stick = (rpt->buttons & (1<<3)) << 7;
+      uint16_t capture = (rpt->buttons & (1<<4)) << 9;
+      buttons = (buttons & ~0b10010101010000U) |
+        left_trigger | left_throttle | minus | left_stick | capture;
+      bool up = rpt->buttons & (1<<5);
+      bool down = rpt->buttons & (1<<6);
+      bool left = rpt->buttons & (1<<7);
+      bool right = rpt->buttons & (1<<8);
+      Gamepad.dPad(up, down, left, right);
+      Gamepad.leftXAxis(rpt->x);
+      Gamepad.leftYAxis(rpt->y);
+    } else {
+      uint16_t right_trigger = (rpt->buttons & (1<<0)) << 5;
+      uint16_t right_throttle = (rpt->buttons & (1<<1)) << 6;
+      uint16_t plus = (rpt->buttons & (1<<2)) << 7;
+      uint16_t right_stick = (rpt->buttons & (1<<3)) << 8;
+      uint16_t home = (rpt->buttons & (1<<4)) << 8;
+      uint16_t ybax = (rpt->buttons & (0b1111U << 5)) >> 5;
+      buttons = ((buttons & ~0b1101010101111U)) | ybax |
+        right_trigger | right_throttle | plus | right_stick | home;
+      Gamepad.rightXAxis(rpt->x);
+      Gamepad.rightYAxis(rpt->y);
+    }
+    Gamepad.buttons(buttons);
+    old_buttons = buttons;
+  }
+}
+
 void loop() {
   delay(1);
-  for (size_t instance = 0; instance < MAX_ARCADE; instance++) {
-    if (Arcade[instance].connected) {
-      if (Arcade[instance].available) {
-        if (sizeof(Arcade[instance].report) == Arcade[instance].report_len) {
-          if (Arcade[instance].debug) {
-            uint8_t *rpt = (uint8_t *)&Arcade[instance].report;
-            DBG_printf("Arcade[instance] report(%d): ", Arcade[instance].report_len);
-            for (uint16_t i = 0; i < Arcade[instance].report_len; i++) {
-              DBG_printf("0x%02X ", rpt[i]);
-            }
-            DBG_println();
-          }
-          // Remote wakeup
-          if ( TinyUSBDevice.suspended() ) {
-            // Wake up host if we are in suspend mode
-            // and REMOTE_WAKEUP feature is enabled by host
-            TinyUSBDevice.remoteWakeup();
-          }
-          if (Gamepad.ready()) {
-            volatile Arcade_t *rpt = &Arcade[instance].report;
-            static uint16_t old_buttons = 0;
-            uint16_t buttons = old_buttons;
-            if (Arcade[instance].debug) {
-              DBG_printf("x=%4d, y=%4d, buttons=0x%02x\r\n",
-                  rpt->x, rpt->y, rpt->buttons);
-            }
-            if (instance == 0) {
-              uint16_t left_trigger = (rpt->buttons & (1<<0)) << 4;
-              uint16_t left_throttle = (rpt->buttons & (1<<1)) << 5;
-              uint16_t minus = (rpt->buttons & (1<<2)) << 6;
-              uint16_t left_stick = (rpt->buttons & (1<<3)) << 7;
-              uint16_t capture = (rpt->buttons & (1<<4)) << 9;
-              buttons = (buttons & ~0b10010101010000U) |
-                left_trigger | left_throttle | minus | left_stick | capture;
-              bool up = rpt->buttons & (1<<5);
-              bool down = rpt->buttons & (1<<6);
-              bool left = rpt->buttons & (1<<7);
-              bool right = rpt->buttons & (1<<8);
-              Gamepad.dPad(up, down, left, right);
-              Gamepad.leftXAxis(rpt->x);
-              Gamepad.leftYAxis(rpt->y);
-            } else {
-              uint16_t right_trigger = (rpt->buttons & (1<<0)) << 5;
-              uint16_t right_throttle = (rpt->buttons & (1<<1)) << 6;
-              uint16_t plus = (rpt->buttons & (1<<2)) << 7;
-              uint16_t right_stick = (rpt->buttons & (1<<3)) << 8;
-              uint16_t home = (rpt->buttons & (1<<4)) << 8;
-              uint16_t ybax = (rpt->buttons & (0b1111U << 5)) >> 5;
-              buttons = ((buttons & ~0b1101010101111U)) | ybax |
-                right_trigger | right_throttle | plus | right_stick | home;
-              Gamepad.rightXAxis(rpt->x);
-              Gamepad.rightYAxis(rpt->y);
-            }
-            Gamepad.buttons(buttons);
-            Gamepad.loop();
-            old_buttons = buttons;
-          }
+  for (size_t dev_addr = 0; dev_addr < MAX_HID_DEVICES; dev_addr++) {
+    volatile HID_device_state_t *hid_dev = &HID_devices[dev_addr];
+    if (hid_dev->connected) {
+      if (hid_dev->available) {
+        // Remote wakeup
+        if ( TinyUSBDevice.suspended() ) {
+          // Wake up host if we are in suspend mode
+          // and REMOTE_WAKEUP feature is enabled by host
+          TinyUSBDevice.remoteWakeup();
         }
-        Arcade[instance].available = false;
+        if (Gamepad.ready()) {
+          switch (hid_dev->hid_type) {
+            case HID_dev_mouse:
+              handle_mouse(hid_dev);
+              break;
+            case HID_dev_arcade_stick:
+              handle_arcade_stick(hid_dev);
+              break;
+            default:
+              break;
+          }
+          Gamepad.loop();
+        }
+        hid_dev->available = false;
+      } else {
+        handle_timeout(hid_dev);
       }
     }
   }
@@ -261,20 +367,69 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_re
 
   DBG_printf("HID device address = %d, instance = %d is mounted\r\n", dev_addr, instance);
   DBG_printf("VID = %04x, PID = %04x\r\n", vid, pid);
+  if (dev_addr > 4) return;
+  volatile HID_device_state_t *hid_dev = &HID_devices[dev_addr-1];
+  memset((void *)hid_dev->report, 0, sizeof(hid_dev->report));
+  hid_dev->report_len = 0;
+  hid_dev->dev_addr = dev_addr;
+  hid_dev->instance = instance;
+  hid_dev->report_count = 0;
+  hid_dev->available_count = 0;
+  hid_dev->last_millis = 0;
+  hid_dev->available = false;
+  hid_dev->xmin = hid_dev->xmax = 0;
+  hid_dev->ymin = hid_dev->ymax = 0;
+  if ((vid == ARCADE_VID) && (pid == ARCADE_PID)) {
+    DBG_println("arcade stick connected");
+    hid_dev->connected = true;
+    hid_dev->hid_type = HID_dev_arcade_stick;
+    hid_dev->skip_report_id = false;
+  } else {
+    uint8_t const protocol_mode = tuh_hid_get_protocol(dev_addr, instance);
+    uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+    DBG_printf("protocol_mode=%d,itf_protocol=%d\r\n",
+        protocol_mode, itf_protocol);
+    const size_t REPORT_INFO_MAX = 8;
+    tuh_hid_report_info_t report_info[REPORT_INFO_MAX];
+    uint8_t report_num = tuh_hid_parse_report_descriptor(report_info,
+        REPORT_INFO_MAX, desc_report, desc_len);
+    Serial.printf("HID descriptor reports:%d\r\n", report_num);
+    if ((report_num == 0) && (itf_protocol == 2)) {
+      if (!hid_dev->connected) {
+        // Mouse report
+        DBG_println("mouse connected");
+        hid_dev->connected = true;
+        hid_dev->hid_type = HID_dev_mouse;
+      }
+    } else {
+      for (size_t i = 0; i < report_num; i++) {
+        DBG_printf("%d,%d,%d\r\n", report_info[i].report_id, report_info[i].usage,
+            report_info[i].usage_page);
+        hid_dev->skip_report_id = false;
+        hid_dev->hid_type = HID_dev_unknown;
+        if (!hid_dev->connected && (report_info[i].usage_page == 1) && (report_info[i].usage == 2)) {
+          // Mouse report
+          DBG_println("mouse connected");
+          hid_dev->connected = true;
+          hid_dev->hid_type = HID_dev_mouse;
+          if (itf_protocol == HID_ITF_PROTOCOL_NONE)
+            hid_dev->skip_report_id = report_info[i].report_id != 0;
+          else if (protocol_mode == HID_PROTOCOL_BOOT)
+            hid_dev->skip_report_id = false;
+          else
+            hid_dev->skip_report_id = report_info[i].report_id != 0;
+          break;
+        }
+      }
+    }
+  }
+
   DBG_print("HID report descriptor: ");
   for (size_t i = 0; i < desc_len; i++) {
     DBG_print(desc_report[i], HEX);
     DBG_print(',');
   }
   DBG_println();
-  if ((vid == Arcade[instance].USB_VID) && (pid == Arcade[instance].USB_PID)) {
-    DBG_printf("Arcade[instance] (%d) connected\r\n", instance);
-    Arcade[instance].connected = true;
-    Arcade[instance].available = false;
-    Arcade[instance].dev_addr = dev_addr;
-    Arcade[instance].instance = instance;
-    memset((Arcade_t *)&Arcade[instance].report, 0, sizeof(Arcade[instance].report));
-  }
   if (!tuh_hid_receive_report(dev_addr, instance)) {
     DBG_printf("Error: cannot request to receive report\r\n");
   }
@@ -283,21 +438,29 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_re
 // Invoked when device with hid interface is un-mounted
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
   DBG_printf("HID device address = %d, instance = %d is unmounted\r\n", dev_addr, instance);
-  if ((Arcade[instance].dev_addr == dev_addr) && (Arcade[instance].instance == instance)) {
-    if (Arcade[instance].connected) {
-      Arcade[instance].connected = false;
-      Arcade[instance].available = false;
-      DBG_printf("Arcade controller (%d) disconnected\r\n", instance);
+  if (dev_addr > 4) return;
+  volatile HID_device_state_t *hid_dev = &HID_devices[dev_addr-1];
+  if ((hid_dev->dev_addr == dev_addr) && (hid_dev->instance == instance)) {
+    if (hid_dev->connected) {
+      hid_dev->connected = false;
+      hid_dev->available = false;
+      hid_dev->hid_type= HID_dev_unknown;
+      DBG_printf("HID device (%d) disconnected\r\n", instance);
     }
   }
 }
 
 // Invoked when received report from device via interrupt endpoint
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *report, uint16_t len) {
-  if (Arcade[instance].connected && (Arcade[instance].dev_addr == dev_addr) && (Arcade[instance].instance == instance)) {
-    memcpy((Arcade_t *)&Arcade[instance].report, report, min(sizeof(Arcade[instance].report), len));
-    Arcade[instance].report_len = len;
-    Arcade[instance].available = true;
+  if (dev_addr > 4) return;
+  volatile HID_device_state_t *hid_dev = &HID_devices[dev_addr-1];
+  if (hid_dev->connected && (hid_dev->dev_addr == dev_addr) && (hid_dev->instance == instance)) {
+    memcpy((void *)hid_dev->report, report, min(sizeof(hid_dev->report), len));
+    hid_dev->report_len = len;
+    hid_dev->last_millis = millis();
+    hid_dev->report_count++;
+    hid_dev->available_count++;
+    hid_dev->available = true;
   }
 
   // continue to request to receive report

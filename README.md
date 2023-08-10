@@ -18,6 +18,8 @@ The left joystick with blue buttons matches the left blue joycon. The joystick
 corresponds to the small blue joycon joystick. The blue arcade buttons map to
 the left side joycon buttons. Similarly for the right joystick.
 
+Support for for one USB trackball has been added. See the end of this article.
+
 ## Left Side Blue Controls
 
 ![Left joystick arcade controller with labels showing joycon buttons](./images/left_blue.jpg)
@@ -84,15 +86,16 @@ code. The board is ready to be used with a Nintendo Switch and arcade controls.
 
 Highly recommended tutorial https://learn.adafruit.com/adafruit-feather-rp2040-with-usb-type-a-host
 if you want to customize the software. See the section on setting up the Arduino
-IDE.
+IDE and installing the Arduino-Pico board package.
 
-This is valuable source of information for connecting analog joysticks to the
-board analog inputs. Or if connecting more buttons for macros to the board
-digital inputs. Some soldering required.
+The tutorial is valuable source of information for connecting analog joysticks
+to the board analog inputs. Or if connecting more buttons for macros to the
+board digital inputs. Some soldering required.
 
 ## Dependencies
 
 * Arduino IDE 1.8.19 (but IDE 2.x should also work)
+* https://github.com/earlephilhower/arduino-pico
 
 Install the following libraries using the IDE Library manager.
 
@@ -109,3 +112,18 @@ use the IDE "Add .ZIP library" option to install it.
 * Set "Board" to "Adafruit Feather RP2040 USB Host"
 * Set "USB Stack" to "Adafruit TinyUSB"
 * Set "CPU Speed" to 120MHz.
+
+## USB Trackball
+
+![USB trackball connected to Nintendo Switch](./images/trackball.jpg)
+
+Instead of plugging in a hub and two USB arcade controllers, a single USB mouse
+or trackball may be used. The mouse/trackball movement controls the left
+joystick. The left mouse/trackball button controls the gamepad A button. The
+right mouse/trackball button controls the gamepad B button.
+
+A trackball is useful for classic games such a Missile Command or Centipede
+because the 1980's arcade cabinets used trackballs instead of joysticks. A
+large Kensington trackball works nicely with Missile Command.
+
+Warning: Fancy gaming mice with lots of extra buttons may not work.
