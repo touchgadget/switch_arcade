@@ -118,11 +118,16 @@ volatile HID_device_state_t HID_devices[MAX_HID_DEVICES];
 #include "switch_tinyusb.h"
 
 // USB Device gamepad
+const uint8_t NS_AXIS_CENTER = 128;
 Adafruit_USBD_HID G_usb_hid;
 NSGamepad Gamepad(&G_usb_hid);
 
 // USB Host object for arcade controllers
 Adafruit_USBH_Host USBHost;
+
+float Curr_Speed_X = 0.4f;
+float Curr_Speed_Y = 0.4f;
+uint8_t Curr_Deadzone = 8;
 
 uint8_t X_SENSITIVITY[129];
 uint8_t Y_SENSITIVITY[129];
@@ -172,7 +177,7 @@ void setup()
 #endif
 
   DBG_println("Switch TinyUSB Gamepad mounted");
-  sensitivity(0.5f, 0.5f, 2);
+  sensitivity(Curr_Speed_X, Curr_Speed_Y, Curr_Deadzone);
 }
 
 // Swap buttons 0 and 2 so the joystick trigger maps to the gamepad A button.
@@ -200,6 +205,20 @@ void handle_mouse(volatile HID_device_state_t *hid_dev) {
     } else {
       Gamepad.release(NSButton_B);
     }
+    if (buttons & 4) {
+      DBG_printf("Speed: %f\r\n", Curr_Speed_X);
+      if (Curr_Speed_X > 0.1f) {
+        Curr_Speed_X = Curr_Speed_Y = Curr_Speed_X - 0.1f;
+        sensitivity(Curr_Speed_X, Curr_Speed_Y, Curr_Deadzone);
+      }
+    }
+    if (buttons & 8) {
+      DBG_printf("Speed: %f\r\n", Curr_Speed_X);
+      if (Curr_Speed_X < 1.0f) {
+        Curr_Speed_X = Curr_Speed_Y = Curr_Speed_X + 0.1f;
+        sensitivity(Curr_Speed_X, Curr_Speed_Y, Curr_Deadzone);
+      }
+    }
     int8_t x = (int8_t)hid_dev->report[1];
     int8_t y = (int8_t)hid_dev->report[2];
     if (x < 0)
@@ -225,19 +244,31 @@ void handle_mouse(volatile HID_device_state_t *hid_dev) {
       Gamepad.rightXAxis(u8x);
       Gamepad.rightYAxis(u8y);
     }
+    if (hid_dev->report_len > 3) {    // Scroll
+      int8_t scroll = (int8_t)hid_dev->report[3];
+      DBG_printf("scroll: %d Speed: %f\r\n", scroll, Curr_Speed_X);
+      if (Curr_Speed_X < 1.0f && scroll > 0) {
+        Curr_Speed_X = Curr_Speed_Y = Curr_Speed_X + 0.1f;
+        sensitivity(Curr_Speed_X, Curr_Speed_Y, Curr_Deadzone);
+      } else if (Curr_Speed_X > 0.1f && scroll < 0) {
+        Curr_Speed_X = Curr_Speed_Y = Curr_Speed_X - 0.1f;
+        sensitivity(Curr_Speed_X, Curr_Speed_Y, Curr_Deadzone);
+      }
+    }
   }
   hid_dev->available = false;
 }
 
 void handle_timeout(volatile HID_device_state_t *hid_dev) {
+  if (hid_dev->hid_type != HID_dev_mouse) return;
   if ((millis() - hid_dev->last_millis) > 31) {
     // Center x,y if no HID report for 32 ms.
     if (hid_dev->dev_addr & 1) {
-      Gamepad.leftXAxis(127);
-      Gamepad.leftYAxis(127);
+      Gamepad.leftXAxis(NS_AXIS_CENTER);
+      Gamepad.leftYAxis(NS_AXIS_CENTER);
     } else {
-      Gamepad.rightXAxis(127);
-      Gamepad.rightYAxis(127);
+      Gamepad.rightXAxis(NS_AXIS_CENTER);
+      Gamepad.rightYAxis(NS_AXIS_CENTER);
     }
     hid_dev->last_millis = millis();
     Gamepad.loop();
