@@ -56,10 +56,12 @@ SOFTWARE.
 #define DBG_print(...)    Serial.print(__VA_ARGS__)
 #define DBG_println(...)  Serial.println(__VA_ARGS__)
 #define DBG_printf(...)   Serial.printf(__VA_ARGS__)
+#define DBG_flush(...)    Serial.flush(__VA_ARGS__)
 #else
 #define DBG_print(...)
 #define DBG_println(...)
 #define DBG_printf(...)
+#define DBG_flush(...)
 #endif
 
 #include <stdint.h>
@@ -127,7 +129,7 @@ Adafruit_USBH_Host USBHost;
 
 float Curr_Speed_X = 0.4f;
 float Curr_Speed_Y = 0.4f;
-uint8_t Curr_Deadzone = 8;
+uint8_t Curr_Deadzone = 2;
 
 uint8_t X_SENSITIVITY[129];
 uint8_t Y_SENSITIVITY[129];
@@ -235,8 +237,12 @@ void handle_mouse(volatile HID_device_state_t *hid_dev) {
     hid_dev->ymax = smax(y, hid_dev->ymax);
     uint8_t u8x = map(x, hid_dev->xmin, hid_dev->xmax, 0, 255);
     uint8_t u8y = map(y, hid_dev->ymin, hid_dev->ymax, 0, 255);
+#if 0
     DBG_printf("xmin %d x %d xmax %d u8x %d ymin %d y %d ymax %d u8y %d\r\n",
         hid_dev->xmin, x, hid_dev->xmax, u8x, hid_dev->ymin, y, hid_dev->ymax, u8y);
+#else
+    DBG_println('.'); DBG_flush();
+#endif
     if (hid_dev->dev_addr & 1) {
       Gamepad.leftXAxis(u8x);
       Gamepad.leftYAxis(u8y);
@@ -275,9 +281,12 @@ void handle_timeout(volatile HID_device_state_t *hid_dev) {
   }
 }
 
+#define NS_CENTER(a)  ((a == 127) ? NS_AXIS_CENTER : a)
+
 void handle_arcade_stick(volatile HID_device_state_t *hid_dev) {
   if (sizeof(Arcade_t) == hid_dev->report_len) {
     volatile Arcade_t *rpt = (volatile Arcade_t *)&hid_dev->report;
+    DBG_printf("x: %d y: %d\r\n", rpt->x, rpt->y);
     static uint16_t old_buttons = 0;
     uint16_t buttons = old_buttons;
     if (hid_dev->dev_addr & 1) {
@@ -293,8 +302,8 @@ void handle_arcade_stick(volatile HID_device_state_t *hid_dev) {
       bool left = rpt->buttons & (1<<7);
       bool right = rpt->buttons & (1<<8);
       Gamepad.dPad(up, down, left, right);
-      Gamepad.leftXAxis(rpt->x);
-      Gamepad.leftYAxis(rpt->y);
+      Gamepad.leftXAxis(NS_CENTER(rpt->x));
+      Gamepad.leftYAxis(NS_CENTER(rpt->y));
     } else {
       uint16_t right_trigger = (rpt->buttons & (1<<0)) << 5;
       uint16_t right_throttle = (rpt->buttons & (1<<1)) << 6;
@@ -304,8 +313,8 @@ void handle_arcade_stick(volatile HID_device_state_t *hid_dev) {
       uint16_t ybax = (rpt->buttons & (0b1111U << 5)) >> 5;
       buttons = ((buttons & ~0b1101010101111U)) | ybax |
         right_trigger | right_throttle | plus | right_stick | home;
-      Gamepad.rightXAxis(rpt->x);
-      Gamepad.rightYAxis(rpt->y);
+      Gamepad.rightXAxis(NS_CENTER(rpt->x));
+      Gamepad.rightYAxis(NS_CENTER(rpt->y));
     }
     Gamepad.buttons(buttons);
     old_buttons = buttons;
@@ -313,7 +322,6 @@ void handle_arcade_stick(volatile HID_device_state_t *hid_dev) {
 }
 
 void loop() {
-  delay(1);
   for (size_t dev_addr = 0; dev_addr < MAX_HID_DEVICES; dev_addr++) {
     volatile HID_device_state_t *hid_dev = &HID_devices[dev_addr];
     if (hid_dev->connected) {
@@ -335,7 +343,7 @@ void loop() {
             default:
               break;
           }
-          Gamepad.loop();
+          Gamepad.write();  // loop
         }
         hid_dev->available = false;
       } else {
@@ -351,7 +359,7 @@ void loop() {
 
 void setup1() {
 #if USB_DEBUG
-  while (!Serial) { delay(1); }
+  while (!Serial && (millis() < 3000)) { delay(10); }
 #endif
   DBG_println("Core1 setup to run TinyUSB host with pio-usb");
 
@@ -359,7 +367,7 @@ void setup1() {
   uint32_t cpu_hz = clock_get_hz(clk_sys);
   if ( cpu_hz != 120000000UL && cpu_hz != 240000000UL ) {
 #if USB_DEBUG
-    while (!Serial) { delay(1); }
+    while (!Serial && (millis() < 3000)) { delay(10); }
 #endif
     DBG_printf("Error: CPU Clock = %lu, PIO USB require CPU clock must be multiple of 120 Mhz\r\n", cpu_hz);
     DBG_println("Change your CPU Clock to either 120 or 240 Mhz in Menu->CPU Speed");
@@ -485,13 +493,18 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *report, uint16_t len) {
   if (dev_addr > 4) return;
   volatile HID_device_state_t *hid_dev = &HID_devices[dev_addr-1];
-  if (hid_dev->connected && (hid_dev->dev_addr == dev_addr) && (hid_dev->instance == instance)) {
-    memcpy((void *)hid_dev->report, report, min(sizeof(hid_dev->report), len));
-    hid_dev->report_len = len;
-    hid_dev->last_millis = millis();
-    hid_dev->report_count++;
-    hid_dev->available_count++;
-    hid_dev->available = true;
+  if (hid_dev->available) {
+    static uint32_t dropped = 0;
+    DBG_printf("drops=%lu\r\n", ++dropped);
+  } else {
+    if (hid_dev->connected && (hid_dev->dev_addr == dev_addr) && (hid_dev->instance == instance)) {
+      memcpy((void *)hid_dev->report, report, min(sizeof(hid_dev->report), len));
+      hid_dev->report_len = len;
+      hid_dev->last_millis = millis();
+      hid_dev->report_count++;
+      hid_dev->available_count++;
+      hid_dev->available = true;
+    }
   }
 
   // continue to request to receive report
